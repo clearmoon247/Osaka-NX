@@ -29,7 +29,7 @@ Requirements: a Pokémon Stadium (US, v1.0) ROM you own, an x86-64 Linux machine
 15-20 GB of free disk and roughly 1-2 hours for the first build. From the cloned repository:
 
 ```
-git clone --recursive <this repository's URL> osaka-nx && cd osaka-nx
+git clone --recursive https://github.com/clearmoon247/Osaka-NX.git osaka-nx && cd osaka-nx
 switch/all.sh /path/to/your/Pokemon_Stadium_US.z64
 ```
 
