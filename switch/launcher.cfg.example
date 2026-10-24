@@ -1,0 +1,9 @@
+# Copy to sdmc:/switch/osaka-nx/launcher.cfg and edit, or let the start-up picker write it (hold L while starting).
+# One Game Boy cartridge per controller port (1-4). Paths are relative to that folder, or rooted on the SD card (e.g. /roms/pokemon-red.gb; do not write "sdmc:/...", it is read as relative).
+# Pokemon Stadium (1) reads Generation 1 cartridges only: Pokemon Red, Blue, Yellow (and Japanese Green).
+# Gold, Silver and Crystal are not supported. A ROM AND its .sav are needed. Use your own dumps.
+# The save is written back as you play: keep a copy of the original .sav first.
+p1_rom=gb/pokemon-yellow.gbc
+p1_save=gb/pokemon-yellow.sav
+#p2_rom=gb/pokemon-red.gb
+#p2_save=gb/pokemon-red.sav

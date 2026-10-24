@@ -1,0 +1,257 @@
+diff --git a/src/Combiner.cpp b/src/Combiner.cpp
+index c785837..e1027e2 100644
+--- a/src/Combiner.cpp
++++ b/src/Combiner.cpp
+@@ -2,6 +2,8 @@
+ #include <functional>
+ #include <cstring>
+ #include <stdio.h>
++#include <chrono>
++#include <vector>
+ #include <osal_files.h>
+ 
+ #include "Combiner.h"
+@@ -14,6 +16,17 @@
+ 
+ using namespace graphics;
+ 
++// PSRNX: shader warm-up. Mesa/nouveau on the Switch compiles a combiner shader in ~100-500 ms on the GL thread and has no program
++// binary cache, so the first time an effect is drawn the game freezes. The shaders earlier runs needed are built before the game starts.
++extern "C" {
++	// Time budget (ms) for the start-up warm-up, 0 = off. Set from osaka-nx.cfg (shader_warm_ms) before the plugin starts.
++	int psrnx_shader_warm_ms = 20000;
++	// Defined by the port (switch/render_gliden64.cpp): the known combiner keys, in the order they were first needed;
++	// and a note that a key had to be built on demand, so it is remembered for next time.
++	unsigned psrnx_shader_keys(unsigned long long * _out, unsigned _max);
++	void psrnx_shader_key_seen(unsigned long long _mux);
++}
++
+ static u32 saRGBExpanded[] =
+ {
+ 	G_GCI_COMBINED,			G_GCI_TEXEL0,			G_GCI_TEXEL1,			G_GCI_PRIMITIVE,
+@@ -122,6 +135,42 @@ void CombinerInfo::init()
+ 
+ 	m_bAsyncCompilation = config.video.asyncShaderCompilation != 0 &&
+ 		Context::AsyncShaderCompilation;
++	printf("[PSRNX] shaders: async compilation %s (config=%d, driver support=%d), shader storage config=%d\n",
++	       m_bAsyncCompilation ? "on" : "off", config.video.asyncShaderCompilation, Context::AsyncShaderCompilation ? 1 : 0,
++	       config.generalEmulation.enableShadersStorage);
++
++	if (psrnx_shader_warm_ms > 0) {
++		std::vector<unsigned long long> keys(1024);
++		keys.resize(psrnx_shader_keys(keys.data(), static_cast<unsigned>(keys.size())));
++		CombinerProgram * const keep = m_pCurrent;
++		const auto w0 = std::chrono::steady_clock::now();
++		unsigned built = 0, cached = 0;
++		long long msBuilt = 0;
++		size_t next = 0;
++		for (; next < keys.size(); ++next) {
++			const CombinerKey key(keys[next], false);
++			if (m_combiners.find(key) != m_combiners.end()) {
++				++cached;
++				continue;
++			}
++			const auto n0 = std::chrono::steady_clock::now();
++			const long long spent = std::chrono::duration_cast<std::chrono::milliseconds>(n0 - w0).count();
++			if (spent >= psrnx_shader_warm_ms)
++				break;
++			CombinerProgram * const prog = Combiner_Compile(key);
++			m_combiners[prog->getKey()] = prog;
++			msBuilt += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - n0).count();
++			++built;
++		}
++		if (keep != nullptr) {
++			m_pCurrent = keep;
++			keep->activate();
++		}
++		m_bChanged = true;
++		const long long total = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - w0).count();
++		printf("[PSRNX] shader warm-up: %u built in %lld ms (%lld ms of compiling), %u already cached, %u left over (budget %d ms)\n",
++		       built, total, msBuilt, cached, static_cast<unsigned>(keys.size() - next), psrnx_shader_warm_ms);
++	}
+ }
+ 
+ void CombinerInfo::destroy()
+@@ -288,11 +337,23 @@ void Combiner_GetStages(const CombinerKey & key, Combiner & color, Combiner & al
+ 	}
+ }
+ 
++// PSRNX: which combiner keys the game really used, and how long each build took (see switch/render_gliden64.cpp).
++extern "C" {
++	void psrnx_shader_key_used(unsigned long long _mux);
++	void psrnx_shader_compiled(unsigned long long _mux, long _us);
++}
++__attribute__((used)) static const char psrnx_shaderused_tag[] = "psrnx-shaderused-patch";
++
+ graphics::CombinerProgram * Combiner_Compile(CombinerKey key)
+ {
+ 	Combiner color, alpha;
+ 	Combiner_GetStages(key, color, alpha);
+-	return gfxContext.createCombinerProgram(color, alpha, key);
++	const auto psrnxT0 = std::chrono::steady_clock::now();
++	graphics::CombinerProgram * const psrnxProg = gfxContext.createCombinerProgram(color, alpha, key);
++	psrnx_shader_compiled(static_cast<unsigned long long>(key.getMux()),
++		static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - psrnxT0).count()));
++	(void)psrnx_shaderused_tag;
++	return psrnxProg;
+ }
+ 
+ void Combiner_Compile_Async(CombinerKey key)
+@@ -327,6 +388,7 @@ void CombinerInfo::setCombine(u64 _mux )
+ 	if (iter != m_combiners.end()) {
+ 		m_pCurrent = iter->second;
+ 		m_bChanged = true;
++		psrnx_shader_key_used(static_cast<unsigned long long>(key.getMux()));
+ 		return;
+ 	}
+ 
+@@ -343,10 +405,24 @@ void CombinerInfo::setCombine(u64 _mux )
+ 		return;
+ 	}
+ 
++	// PSRNX: time every synchronous shader build (Mesa/nouveau on the Switch has no program binary cache).
++	const auto t0 = std::chrono::steady_clock::now();
+ 	m_pCurrent = Combiner_Compile(key);
++	const auto t1 = std::chrono::steady_clock::now();
+ 	m_pCurrent->update(true);
++	const auto t2 = std::chrono::steady_clock::now();
+ 	m_combiners[m_pCurrent->getKey()] = m_pCurrent;
+ 	m_bChanged = true;
++	psrnx_shader_key_seen(static_cast<unsigned long long>(key.getMux()));
++	{
++		static unsigned s_built = 0;
++		++s_built;
++		const long build_us = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
++		const long upd_us = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
++		if (build_us + upd_us > 5000 || s_built <= 8)
++			printf("[PSRNX] shader #%u: build %ld us, first update %ld us, mux=%016llX (%u combiners cached)\n", s_built, build_us, upd_us,
++			       static_cast<unsigned long long>(key.getMux()), static_cast<unsigned>(m_combiners.size()));
++	}
+ }
+ 
+ void CombinerInfo::processPendingCombiners(bool _wait)
+@@ -357,7 +433,10 @@ void CombinerInfo::processPendingCombiners(bool _wait)
+ 	graphics::Combiners compiled;
+ 	gfxContext.getCompiledCombinerPrograms(compiled, _wait);
+ 	for (auto & item : compiled) {
+-		m_combiners[item.first] = item.second;
++		if (m_combiners.find(item.first) == m_combiners.end())
++			m_combiners[item.first] = item.second;
++		else
++			delete item.second;
+ 		m_pendingCombiners.erase(item.first);
+ 	}
+ }
+diff --git a/src/FrameBuffer.cpp b/src/FrameBuffer.cpp
+index 9d6ba51..443c544 100644
+--- a/src/FrameBuffer.cpp
++++ b/src/FrameBuffer.cpp
+@@ -31,6 +31,16 @@
+ using namespace std;
+ using namespace graphics;
+ 
++// PSRNX present probe: render_gliden64.cpp installs a hook that receives how the frame was composed (v[0..31], see
++// the fill-in below) just before the swap. Costs one pointer test per present when nothing is installed.
++extern "C" {
++	void (*psrnx_present_hook)(const int * v) = nullptr;
++	int psrnx_vi_cfb = 0;
++	// Which field Stadium's interlaced menus are drawn as: 0 = GLideN64's own guess (it flips the field on every present
++	// because the VI registers never change, which moved the picture one line up and down), 1 = always the upper field, 2 = lower.
++	int psrnx_vi_field_mode = 1;
++}
++
+ FrameBuffer::FrameBuffer()
+ 	: m_copyFBO(ObjectHandle::defaultFramebuffer)
+ 	, m_ColorBufferFBO(0)
+@@ -1250,7 +1260,7 @@ bool FrameBufferList::RdpUpdate::update(RdpUpdateResult & _result)
+ 	_result.vi_minhpass = h_start_clamped ? 0 : 8;
+ 	_result.vi_maxhpass = hres_clamped ? 0 : 7;
+ 	_result.vi_width = _SHIFTR(*REG.VI_WIDTH, 0, 12);
+-	_result.vi_lowerfield = lowerfield;
++	_result.vi_lowerfield = (validinterlace && psrnx_vi_field_mode != 0) ? (psrnx_vi_field_mode == 2) : lowerfield;
+ 	_result.vi_origin = _SHIFTR(*REG.VI_ORIGIN, 0, 24);
+ 	_result.vi_fsaa = (*REG.VI_STATUS & 512) == 0;
+ 	_result.vi_divot = (*REG.VI_STATUS & VI_STATUS_DIVOT_ENABLED) != 0;
+@@ -1670,6 +1680,39 @@ void FrameBufferList::renderBuffer()
+ 	gfxContext.bindFramebuffer(bufferTarget::READ_FRAMEBUFFER, ObjectHandle::defaultFramebuffer);
+ 	m_overscan.draw(vFullHeight, rdpRes.vi_ispal);
+ 
++	if (psrnx_present_hook != nullptr) {
++		int v[32] = {};
++		v[0] = static_cast<int>(rdpRes.vi_origin);
++		v[1] = static_cast<int>(pBuffer->m_startAddress);
++		v[2] = static_cast<int>(pBuffer->m_width);
++		v[3] = static_cast<int>(pBuffer->m_height);
++		v[4] = static_cast<int>(pBuffer->m_scale * 1000.0f);
++		v[5] = srcY0;
++		v[6] = dstY0;
++		v[7] = rdpRes.vi_lowerfield ? 1 : 0;
++		v[8] = static_cast<int>(addrOffset);
++		for (int i = 0; i < 4; ++i) {
++			v[9 + i] = srcCoord[i];
++			v[13 + i] = dstCoord[i];
++		}
++		v[17] = static_cast<int>(rdpRes.vi_vres);
++		v[18] = static_cast<int>(rdpRes.vi_hres);
++		v[19] = srcHeight;
++		v[20] = pNextBuffer != nullptr ? 1 : 0;
++		v[21] = pBufferTexture->width;
++		v[22] = pBufferTexture->height;
++		v[23] = XoffsetLeft;
++		v[24] = XoffsetRight;
++		v[25] = static_cast<int>(wnd.getHeight());
++		v[26] = static_cast<int>(wnd.getWidth());
++		v[27] = static_cast<int>(VI.height);
++		v[28] = static_cast<int>(VI.width);
++		v[29] = VI.interlaced ? 1 : 0;
++		v[30] = static_cast<int>(rdpRes.vi_v_start);
++		v[31] = psrnx_vi_cfb;
++		psrnx_present_hook(v);
++	}
++
+ 	wnd.swapBuffers();
+ 	if (m_pCurrent != nullptr) {
+ 		gfxContext.bindFramebuffer(bufferTarget::DRAW_FRAMEBUFFER, m_pCurrent->m_FBO);
+diff --git a/src/Graphics/OpenGLContext/ThreadedOpenGl/atomicops.h b/src/Graphics/OpenGLContext/ThreadedOpenGl/atomicops.h
+index ff828ca..513c31d 100644
+--- a/src/Graphics/OpenGLContext/ThreadedOpenGl/atomicops.h
++++ b/src/Graphics/OpenGLContext/ThreadedOpenGl/atomicops.h
+@@ -349,7 +349,7 @@ extern "C" {
+ }
+ #elif defined(__MACH__)
+ #include <mach/mach.h>
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__SWITCH__)
+ #include <semaphore.h>
+ #endif
+ 
+@@ -483,7 +483,7 @@ namespace moodycamel
+ 				}
+ 			}
+ 		};
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__SWITCH__)
+ 		//---------------------------------------------------------
+ 		// Semaphore (POSIX, Linux)
+ 		//---------------------------------------------------------
+diff --git a/src/VI.cpp b/src/VI.cpp
+index fafa695..ffed15f 100644
+--- a/src/VI.cpp
++++ b/src/VI.cpp
+@@ -23,6 +23,8 @@ using namespace std;
+ 
+ VIInfo VI;
+ 
++extern "C" int psrnx_vi_cfb; // set here, reported by the present probe (FrameBuffer.cpp)
++
+ u16 VI_GetMaxBufferHeight(u16 _width)
+ {
+ 	if (_width > 320 || VI.interlaced)
+@@ -283,6 +285,7 @@ void VI_UpdateScreen()
+ 		}
+ 
+ 		const bool bCFB = (gDP.changed&CHANGED_CPU_FB_WRITE) == CHANGED_CPU_FB_WRITE;
++		psrnx_vi_cfb = bCFB ? 1 : 0;
+ 		bool bNeedSwap = false;
+ 		switch (config.frameBufferEmulation.bufferSwapMode) {
+ 		case Config::bsOnVerticalInterrupt:

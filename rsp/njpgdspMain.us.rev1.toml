@@ -1,0 +1,12 @@
+# RSPRecomp configuration for the JPEG microcode (njpgdspMain) of Pokemon Stadium (US v1.0). Read by switch/tools/gen_rsp.sh,
+# which writes rsp/njpgdspMain.cpp from YOUR ROM; the generated file is not stored in the repository.
+#
+# The microcode text is at ROM 0x68C80 and is 0xAF0 bytes long; it runs at IMEM 0x1080 (rspboot occupies 0x0..0x80, as for
+# aspMain). These numbers were found by matching RSPRecomp's output with the file the upstream project had vendored from
+# Zelda64Recomp: the match is exact apart from the order of the lines in the jump table.
+text_offset = 0x68C80
+text_size = 0xAF0
+text_address = 0x04001080
+rom_file_path = "../baserom.z64"
+output_file_path = "njpgdspMain.cpp"
+output_function_name = "njpgdspMain"

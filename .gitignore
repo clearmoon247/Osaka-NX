@@ -1,0 +1,138 @@
+build/
+build-*/
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.user
+
+# Generated recompiler output (regen via N64Recomp)
+generated/
+
+# Ghidra project state (live DBs are machine-specific, large)
+ghidra/**/*.lock
+ghidra/**/*.lock~
+ghidra/**/*.gpr.bak
+ghidra/**/projects/
+# Ghidra volatile DB / temp state — held open while Ghidra is running,
+# changes constantly, and breaks `git checkout` on Windows because the
+# OS won't unlink files Ghidra has open.
+ghidra/**/~*.db/
+ghidra/**/~index.bak
+ghidra/**/~index.dat
+ghidra/**/~journal.bak
+ghidra/**/tmp*.ps
+
+# Not shipped in Osaka-NX: files that come from the game or from other people's runs. aspmain_combined.bin and rsp/*.cpp are made
+# from your own ROM by switch/codegen.sh (switch/tools/gen_rsp.sh); crash reports and Ghidra projects stay on the machine that made them.
+aspmain_combined.bin
+rsp/*.cpp
+_issue_logs/
+ghidra/
+assets/img/boxart.tga
+
+# Ares emulator build artifacts (submoduled at ares-emulator/)
+ares-emulator/
+
+# N64Recomp engine checkout (cloned by setup.bat/sh, not committed)
+n64recomp/
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+*.log
+_tmp_*
+_baseline_*
+_experimental_*
+_*.png
+_*.pid
+
+# Ad-hoc debug/probe scaffolding under tools/ (the `_`-prefixed scratch
+# scripts from investigations). Permanent, named tools are tracked; these
+# one-offs are not. See tools/README.md.
+tools/_*
+
+# Release packaging scratch / output (the staged zip is uploaded to the
+# GitHub Release, not tracked in git).
+dist/
+_build_console.*
+_release_notes_*
+_package_release.ps1
+
+# ROM data (don't redistribute)
+*.z64
+*.n64
+*.v64
+*.gb
+*.gbc
+
+# Save / dump
+*.sav
+*.srm
+*.state
+saves.txt
+saves/
+launcher.cfg
+tools/_derive.stderr
+tools/_splice.py
+
+# Local-only artifacts (Ghidra project DB, debug drivers, caches, backups)
+ghidra/*.rep/
+tools/_drive_*.py
+__pycache__/
+*.bak
+*.bak-*
+# Build artifacts produced by tools/_decompress_*.py — regenerable from
+# baserom.z64 + the script. The script is the source of truth.
+tools/*_decompressed.bin
+lib/
+
+# Internal docs kept locally only — see the `internal` branch for
+# the full snapshot of these files at the point they were untracked.
+CLAUDE.md
+TO_ADAPT_FROM_BATTLESHIP.md
+
+# Issue #17 raw GB-Tower ring dumps — large (100MB+) UTF-16 debug captures,
+# regenerable from a live run via the debug server (gbtower_trace / tpak_ring).
+# Analysis lives in memory + the session handoff; the raw dumps are not source.
+_issue_logs/issue17_*.json
+
+# ---- Osaka-NX (Nintendo Switch port) -------------------------------------------------------------------------------------
+# Third-party sources that switch/setup_deps.sh downloads at build time (they are never stored in this repository).
+lib/N64ModernRuntime/
+lib/GLideN64/
+# Build output of switch/build.sh (the .nro, object files, logs).
+switch/build/
+# Never commit anything that comes from a game ROM: the ROM itself in any byte order or archive, and the code generated from it.
+baserom.z64
+*.z64
+*.n64
+*.v64
+rom.enc
+rom.7z
+rom.z64
+generated/
+# Python virtual environment and bytecode created by switch/codegen.sh and the tools.
+.venv-codegen/
+__pycache__/
+# Logs written by switch/all.sh, and files the tools in switch/tools/ leave next to themselves when run.
+logs/
+*.nro
+*.nacp
+switch/tools/shader_candidates/inv.pkl
+switch/tools/shader_candidates/gen.c
+switch/tools/shader_candidates/hits.txt
+switch/tools/shader_candidates/src_words.txt
+# Local build state written by switch/build-nro.sh and switch/build-windows.ps1.
+.osaka-work/
+osaka-nx-build-report.txt

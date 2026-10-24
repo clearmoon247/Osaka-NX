@@ -1,0 +1,924 @@
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index 591d9d9..20d845a 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -28,8 +28,15 @@ namespace recomp {
+     // the correct "no DMA in progress / no device present" semantics
+     // without faulting.
+     constexpr size_t mem_size = 1024ULL * 1024ULL * 1024ULL;
++#ifdef __SWITCH__
++    // Horizon has no mmap/mprotect: the window is one eagerly committed block (switch/mman_switch.c), with no 4GB
++    // guard reservation. Stadium's generated MEM_* macros mask addresses with 0x3FFFFFFF, so the window itself
++    // cannot shrink without a recomp.h change (see switch/README.md, "1 GB guest window").
++    constexpr size_t allocation_size = mem_size;
++#else
+     // 4GB (the full address space)
+     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
++#endif
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+     constexpr int32_t cart_handle = 0x80800000;
+     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+diff --git a/librecomp/include/librecomp/audio_uaf_protect.hpp b/librecomp/include/librecomp/audio_uaf_protect.hpp
+index 0a6cdee..a1e1d4e 100644
+--- a/librecomp/include/librecomp/audio_uaf_protect.hpp
++++ b/librecomp/include/librecomp/audio_uaf_protect.hpp
+@@ -9,6 +9,8 @@
+ #ifndef __LIBRECOMP_AUDIO_UAF_PROTECT__
+ #define __LIBRECOMP_AUDIO_UAF_PROTECT__
+ 
++#include <stddef.h>
++#include <cstddef>
+ #include <cstdint>
+ 
+ // libnaudio voice UAF protection.
+diff --git a/librecomp/include/librecomp/gbcart.hpp b/librecomp/include/librecomp/gbcart.hpp
+index a9d0ce1..efb5890 100644
+--- a/librecomp/include/librecomp/gbcart.hpp
++++ b/librecomp/include/librecomp/gbcart.hpp
+@@ -42,6 +42,9 @@ namespace librecomp::gbcart {
+     // which cart addresses/banks a feature (e.g. GB Tower's full-cart read) walks
+     // and where it stalls, without perturbing boot timing.
+     void ring_dump(const char* path, int tail);
++
++    // Total block-I/O operations recorded so far (lets a host poll cheaply whether ring_dump has anything new).
++    uint32_t ring_count();
+ }
+ 
+ #endif // LIBRECOMP_GBCART_HPP
+diff --git a/librecomp/src/files.cpp b/librecomp/src/files.cpp
+index af6f18d..d2fe729 100644
+--- a/librecomp/src/files.cpp
++++ b/librecomp/src/files.cpp
+@@ -36,6 +36,19 @@ bool recomp::finalize_output_file_with_backup(const std::filesystem::path& filep
+     temp_path += temp_suffix;
+ 
+     std::error_code ec;
++#ifdef __SWITCH__
++    // libstdc++'s copy_file ends with fchmod, which libnx's SD driver rejects (ENOSYS), so every
++    // copy fails. Rotate with renames instead; FAT renames refuse an existing target, hence the removes.
++    std::filesystem::remove(backup_path, ec);
++    if (std::filesystem::exists(filepath, ec)) {
++        std::filesystem::rename(filepath, backup_path, ec);
++        if (ec) {
++            return false;
++        }
++    }
++    std::filesystem::rename(temp_path, filepath, ec);
++    return !ec;
++#endif
+     if (std::filesystem::exists(filepath, ec)) {
+         std::filesystem::copy_file(filepath, backup_path, std::filesystem::copy_options::overwrite_existing, ec);
+         if (ec) {
+diff --git a/librecomp/src/gbcart.cpp b/librecomp/src/gbcart.cpp
+index 8f8ce6f..8845112 100644
+--- a/librecomp/src/gbcart.cpp
++++ b/librecomp/src/gbcart.cpp
+@@ -92,16 +92,29 @@ namespace {
+             // GB Tower relies on it: fed the file's zeroes it stops before
+             // installing MBC handlers, so DMG carts (e.g. Pokemon Red/Blue) never
+             // boot. Treat >= 1 whole trailing zero bank as open bus.
++            //
++            // Only WHOLE banks: the open-bus area starts at the next 16 KiB bank
++            // boundary after the last programmed byte, not at the first trailing
++            // zero byte. The last bank that holds game data keeps its zero tail
++            // exactly as dumped: GB Tower verifies that bank against a checksum
++            // table (Red/Blue: bank 0x2C, second half expected to sum to 0), and
++            // 0xFF there fails the check, so it re-reads the bank until its retry
++            // budget runs out and shows "The Transfer Pak is not set properly".
+             const auto last_programmed = std::find_if(
+                 rom.rbegin(), rom.rend(), [](uint8_t byte) { return byte != 0; });
+             if (last_programmed != rom.rend()) {
+                 const size_t trailing_zero_start =
+                     static_cast<size_t>(rom.rend() - last_programmed);
+-                if (rom.size() - trailing_zero_start >= 0x4000) {
+-                    rom_open_bus_start = trailing_zero_start;
++                constexpr size_t bank_size = 0x4000;
++                const size_t whole_bank_start =
++                    (trailing_zero_start + bank_size - 1) & ~(bank_size - 1);
++                if (whole_bank_start < rom.size()) {
++                    rom_open_bus_start = whole_bank_start;
+                     std::fprintf(stderr,
+-                                 "[gbcart] trailing zero ROM padding -> open bus from 0x%zX: %s\n",
+-                                 rom_open_bus_start, rom_path.string().c_str());
++                                 "[gbcart] trailing zero ROM padding -> open bus from 0x%zX "
++                                 "(last programmed byte at 0x%zX): %s\n",
++                                 rom_open_bus_start, trailing_zero_start - 1,
++                                 rom_path.string().c_str());
+                 }
+             }
+ 
+@@ -534,6 +547,11 @@ void flush_all() {
+     }
+ }
+ 
++uint32_t ring_count() {
++    std::scoped_lock lock(port_mutex);
++    return g_ring_seq;
++}
++
+ void ring_dump(const char* path, int tail) {
+     std::scoped_lock lock(port_mutex);
+     std::ofstream f(path, std::ios::trunc);
+diff --git a/librecomp/src/gbpak.cpp b/librecomp/src/gbpak.cpp
+index e7ca17d..38de896 100644
+--- a/librecomp/src/gbpak.cpp
++++ b/librecomp/src/gbpak.cpp
+@@ -13,6 +13,8 @@
+ // ---------------------------------------------------------------------
+ #include <array>
+ #include <cstdint>
++#include <atomic>
++#include <cstdio>
+ #include <cstdlib>
+ 
+ #include "ultramodern/ultra64.h"
+@@ -57,6 +59,17 @@ namespace {
+         osRecvMesg(PASS_RDRAM mq, NULLPTR, OS_MESG_BLOCK);
+     }
+ 
++    // Failures are rare (a call on a channel without a pak, a bad argument), so they are logged: the first 200 only, to keep
++    // a game that probes an empty port in a loop from flooding the log.
++    void log_failure(const char* what, int channel, uint32_t address, int ret) {
++        static std::atomic<uint32_t> count{0};
++        const uint32_t n = count.fetch_add(1, std::memory_order_relaxed);
++        if (n < 200) {
++            std::fprintf(stderr, "[gbpak] %s channel=%d address=0x%04X -> error %d%s\n", what, channel, address, ret,
++                         n == 199 ? " (further failures not logged)" : "");
++        }
++    }
++
+     void wait_for_cont_ram_transfer(uint8_t* rdram, PTR(OSMesgQueue) mq) {
+         wait_for_si_dma(rdram, mq);
+         wait_for_si_dma(rdram, mq);
+@@ -75,6 +88,9 @@ extern "C" void __osContRamRead_recomp(uint8_t* rdram, recomp_context* ctx) {
+     wait_for_cont_ram_transfer(rdram, mq);
+ 
+     const int ret = librecomp::gbcart::read_block(channel, address, block.data());
++    if (ret != 0) {
++        log_failure("__osContRamRead", channel, address, ret);
++    }
+     if (ret == 0) {
+         for (int i = 0; i < librecomp::gbcart::block_size; i++) {
+             MEM_B(i, buffer) = static_cast<int8_t>(block[i]);
+@@ -98,6 +114,9 @@ extern "C" void __osContRamWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
+     wait_for_cont_ram_transfer(rdram, mq);
+ 
+     const int ret = librecomp::gbcart::write_block(channel, address, block.data());
++    if (ret != 0) {
++        log_failure("__osContRamWrite", channel, address, ret);
++    }
+     _return<s32>(ctx, ret);
+ }
+ 
+@@ -107,5 +126,9 @@ extern "C" void __osPfsGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
+     const PTR(OSMesgQueue) mq = _arg<0, PTR(OSMesgQueue)>(rdram, ctx);
+     const int channel = _arg<1, s32>(rdram, ctx);
+     wait_for_cont_ram_transfer(rdram, mq);
+-    _return<s32>(ctx, librecomp::gbcart::has_pak(channel) ? 0 : 1);
++    const int ret = librecomp::gbcart::has_pak(channel) ? 0 : 1;
++    if (ret != 0) {
++        log_failure("__osPfsGetStatus", channel, 0, ret);
++    }
++    _return<s32>(ctx, ret);
+ }
+diff --git a/librecomp/src/mips_interp.cpp b/librecomp/src/mips_interp.cpp
+index 311193a..1b8c55a 100644
+--- a/librecomp/src/mips_interp.cpp
++++ b/librecomp/src/mips_interp.cpp
+@@ -18,6 +18,8 @@
+  * later be JIT'd / folded back into the static build and never interpreted again.
+  */
+ 
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -399,6 +401,24 @@ bool interpret(uint8_t* rdram, recomp_context* ctx, uint32_t start_pc, int depth
+ } // namespace
+ 
+ // Entry point called by the lookup-miss trampoline (overlays.cpp).
++// Wall-clock time spent in the interpreter (outermost entries only, nested native calls included), for the Switch
++// heartbeat: the interpreter is the slow path for code the static recompile has no function for.
++static std::atomic<uint64_t> g_interp_ns{0};
++static std::atomic<uint64_t> g_interp_entries{0};
++extern "C" void recomp_interp_stats(uint64_t* total_ns, uint64_t* entries) {
++    if (total_ns) *total_ns = g_interp_ns.load(std::memory_order_relaxed);
++    if (entries) *entries = g_interp_entries.load(std::memory_order_relaxed);
++}
++
+ extern "C" bool recomp_interpret_function(uint8_t* rdram, recomp_context* ctx, uint32_t start_pc) {
+-    return interpret(rdram, ctx, start_pc, 0);
++    static thread_local int t_depth = 0;
++    const auto t0 = std::chrono::steady_clock::now();
++    ++t_depth;
++    const bool ok = interpret(rdram, ctx, start_pc, 0);
++    if (--t_depth == 0) {
++        g_interp_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                  std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
++        g_interp_entries.fetch_add(1, std::memory_order_relaxed);
++    }
++    return ok;
+ }
+diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
+index 08fe7be..61a64ab 100644
+--- a/librecomp/src/overlays.cpp
++++ b/librecomp/src/overlays.cpp
+@@ -228,6 +228,22 @@ static bool frag_unreg_enabled() {
+     static const bool on = []{ const char* e = std::getenv("PSR_FRAG_UNREG"); return !(e && e[0] == '0'); }();
+     return on;
+ }
++// Multi-instance fragment ids. Stadium's generic CPU-decompressed fragment slot
++// (id 0xEF, bucket 0xFF) is NOT one fragment: the asset loader decompresses many
++// different fragments into it, at different pool addresses, and several of them
++// are live at the same time (e.g. the battle stage + move effect + model code
++// loaded back-to-back for a battle). The single-latest "supersede" model used for
++// ordinary ids (a new load at a different base kills the previous instance's
++// func_map range) is therefore wrong for 0xEF: it unregistered still-running
++// fragments, so their next call missed func_map (the "get_function lookup miss"
++// at a fragment base in last_error.log) and the battle froze after a KO. For these
++// ids an old instance is only dead if a newer one overwrites its memory.
++// base -> extent of each live instance. PSR_FRAG_MULTI=0 restores the old model.
++static bool frag_id_is_multi_instance(uint32_t id) {
++    static const bool on = []{ const char* e = std::getenv("PSR_FRAG_MULTI"); return !(e && e[0] == '0'); }();
++    return on && id == 0xEFu;
++}
++static std::unordered_map<uint32_t, uint32_t> s_frag_multi_live{};
+ static uint32_t frag_range_erase(uint32_t base, uint32_t size) {
+     if (size == 0) return 0;
+     FuncMapWriteLock _fml;
+@@ -238,6 +254,10 @@ static uint32_t frag_range_erase(uint32_t base, uint32_t size) {
+         if (a >= lo && a < hi) doomed.push_back(kv.first);
+     }
+     for (int32_t k : doomed) func_map.erase(k);
++    for (auto it = s_frag_multi_live.begin(); it != s_frag_multi_live.end();) {
++        if (it->first >= lo && it->first < hi) it = s_frag_multi_live.erase(it);
++        else ++it;
++    }
+     return (uint32_t)doomed.size();
+ }
+ // Last live runtime range per fragment id (set in register_runtime_fragment). When the same id
+@@ -333,6 +353,59 @@ static void secaddr_verify(const char* where) {
+     }
+ }
+ 
++// Retire previously registered instances of fragment `id` that a load of
++// [new_base, new_base+new_extent) supersedes. Ordinary ids: the single prior
++// instance, if it sat at a different base (Issue #9 behaviour, unchanged).
++// Multi-instance ids (0xEF): only instances whose memory the new load overlaps;
++// the others are still resident and stay dispatchable. Caller holds the lock.
++static void frag_supersede_prior(uint32_t id, uint32_t new_base, uint32_t new_extent) {
++    if (!frag_unreg_enabled()) return;
++    if (frag_id_is_multi_instance(id)) {
++        const uint32_t lo = new_base, hi = new_base + (new_extent ? new_extent : 4u);
++        std::vector<std::pair<uint32_t, uint32_t>> victims;
++        for (const auto& kv : s_frag_multi_live) {
++            const uint32_t b = kv.first, e = kv.first + kv.second;
++            if (b == new_base) continue;          // same base: evict_prior_at_base's job
++            if (e <= lo || b >= hi) continue;     // disjoint: still live
++            victims.emplace_back(b, kv.second);
++        }
++        for (const auto& v : victims) {
++            uint32_t erased = frag_range_erase(v.first, v.second);
++            for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
++                if ((uint32_t)it->loaded_ram_addr == v.first && (uint32_t)it->loaded_ram_addr != new_base) {
++                    const SectionTableEntry& old_section = sections_info.code_sections[it->section_table_index];
++                    if (section_addresses != nullptr) {
++                        secaddr_set(old_section.index, old_section.ram_addr, "evict-ovl");
++                    }
++                    it = loaded_sections.erase(it);
++                } else {
++                    ++it;
++                }
++            }
++            fprintf(stderr, "[frag-unreg] id=%u instance 0x%08X(size0x%X) overwritten by load at 0x%08X(size0x%X): erased %u func_map entries\n",
++                    id, v.first, v.second, new_base, new_extent, erased);
++            fflush(stderr);
++        }
++        return;
++    }
++    auto prev = s_frag_live_range.find(id);
++    if (prev != s_frag_live_range.end() && prev->second.first != new_base) {
++        uint32_t erased = frag_range_erase(prev->second.first, prev->second.second);
++        if (erased) {
++            fprintf(stderr, "[frag-unreg] id=%u superseded 0x%08X(size0x%X): erased %u stale func_map entries (new base 0x%08X)\n",
++                    id, prev->second.first, prev->second.second, erased, new_base);
++            fflush(stderr);
++        }
++    }
++}
++
++// Record the live extent of the instance just loaded at `base`.
++static void frag_note_live(uint32_t id, uint32_t base, uint32_t extent) {
++    if (extent == 0) return;
++    s_frag_live_range[id] = { base, extent };
++    if (frag_id_is_multi_instance(id)) s_frag_multi_live[base] = extent;
++}
++
+ void recomp::overlays::register_overlays(const overlay_section_table_data_t& sections, const overlays_by_index_t& overlays) {
+     FuncMapWriteLock _fml;
+     sections_info = sections;
+@@ -1191,20 +1264,8 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
+     // relocated bytes (the correct model), which never crashes.
+     auto leave_unregistered = [&]() {
+         evict_prior_at_base((size_t)-1);
+-        if (frag_unreg_enabled()) {
+-            auto prev = s_frag_live_range.find(id);
+-            if (prev != s_frag_live_range.end() && prev->second.first != (uint32_t)fragment_ptr) {
+-                uint32_t erased = frag_range_erase(prev->second.first, prev->second.second);
+-                if (erased) {
+-                    fprintf(stderr, "[frag-unreg] id=%u superseded 0x%08X(size0x%X): erased %u stale func_map entries (no-bind new base 0x%08X)\n",
+-                            id, prev->second.first, prev->second.second, erased, (uint32_t)fragment_ptr);
+-                    fflush(stderr);
+-                }
+-            }
+-        }
+-        if (frag_size_in_ram != 0) {
+-            s_frag_live_range[id] = { (uint32_t)fragment_ptr, frag_size_in_ram };
+-        }
++        frag_supersede_prior(id, (uint32_t)fragment_ptr, frag_size_in_ram);
++        frag_note_live(id, (uint32_t)fragment_ptr, frag_size_in_ram);
+     };
+ 
+     size_t found_index = (size_t)-1;
+@@ -1530,17 +1591,11 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
+     // that prior instance is now superseded — completely unregister its runtime range so its
+     // function-start / trampoline / interior-entry aliases can't resolve to old code under the
+     // new section base. (Same-base reload just overwrites the same keys; no stale residue.)
+-    if (frag_unreg_enabled()) {
+-        auto prev = s_frag_live_range.find(id);
+-        if (prev != s_frag_live_range.end() && prev->second.first != (uint32_t)fragment_ptr) {
+-            uint32_t erased = frag_range_erase(prev->second.first, prev->second.second);
+-            if (erased) {
+-                fprintf(stderr, "[frag-unreg] id=%u superseded 0x%08X(size0x%X): erased %u stale func_map entries (new base 0x%08X)\n",
+-                        id, prev->second.first, prev->second.second, erased, (uint32_t)fragment_ptr);
+-                fflush(stderr);
+-            }
+-        }
+-    }
++    // Ordinary ids keep the Issue #9 extent (the section's size); multi-instance ids
++    // use the loaded fragment's resident extent so the overlap test sees all of it.
++    const uint32_t bound_extent = (frag_id_is_multi_instance(id) && frag_size_in_ram > (uint32_t)section.size)
++                                      ? frag_size_in_ram : (uint32_t)section.size;
++    frag_supersede_prior(id, (uint32_t)fragment_ptr, bound_extent);
+ 
+     // Register every FuncEntry at both the runtime address and the
+     // section's link-time vram (mirroring load_overlay). The link-time
+@@ -1565,7 +1620,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
+ 
+     // Issue #9 Phase 1: record this instance's live runtime range so the NEXT load of this id
+     // at a different base can supersede-unregister it (above).
+-    s_frag_live_range[id] = { (uint32_t)fragment_ptr, (uint32_t)section.size };
++    frag_note_live(id, (uint32_t)fragment_ptr, bound_extent);
+ 
+     // Per-variant synthetic-vram registration: if this section has a
+     // synthetic link identity (ram_addr in the synthetic pool), populate
+diff --git a/librecomp/src/rsp.cpp b/librecomp/src/rsp.cpp
+index 253a011..73ff0de 100644
+--- a/librecomp/src/rsp.cpp
++++ b/librecomp/src/rsp.cpp
+@@ -48,6 +48,8 @@ constexpr uint64_t kSpStatusAddr = 0xFFFFFFFFA4040010ull;
+ constexpr uint32_t kSpStatusSignal3 = 1u << 10;
+ std::atomic<uint32_t> g_sp_status{0};
+ std::atomic<uint32_t> g_sp_status_preempt_skip_budget{0};
++// Diagnostic counters for the Switch port: writes to SP_STATUS that touch signals 2/3, and forced signal 3 raises.
++std::atomic<uint64_t> g_diag_sig_writes[6] = {};   // set3, clr3, set2, clr2, all writes, forced raises
+ 
+ struct RspDmaTraceEvent {
+     uint64_t seq;
+@@ -211,6 +213,11 @@ void recomp::rsp::dma_rdram_to_dmem_external(uint8_t* rdram,
+ }
+ 
+ void recomp::rsp::write_sp_status(uint8_t* rdram, uint32_t value) {
++    if (value & (1u << 16)) g_diag_sig_writes[0].fetch_add(1, std::memory_order_relaxed);
++    if (value & (1u << 15)) g_diag_sig_writes[1].fetch_add(1, std::memory_order_relaxed);
++    if (value & (1u << 14)) g_diag_sig_writes[2].fetch_add(1, std::memory_order_relaxed);
++    if (value & (1u << 13)) g_diag_sig_writes[3].fetch_add(1, std::memory_order_relaxed);
++    g_diag_sig_writes[4].fetch_add(1, std::memory_order_relaxed);
+     uint32_t old_status = g_sp_status.load(std::memory_order_relaxed);
+     uint32_t new_status = 0;
+     do {
+@@ -240,6 +247,19 @@ extern "C" uint32_t recomp_rsp_get_sp_status(void) {
+     return g_sp_status.load(std::memory_order_relaxed);
+ }
+ 
++extern "C" void recomp_rsp_diag_counters(uint64_t* out6) {
++    for (int i = 0; i < 6; i++) out6[i] = g_diag_sig_writes[i].load(std::memory_order_relaxed);
++}
++
++// Raise SP status signal 3 by hand (and publish it to the CPU-visible mirror). The Game Boy emulator in Stadium's GB Tower
++// polls that bit to learn that its RSP task has started; the port's watchdog calls this when the poll has made no progress
++// for seconds so that a lost handshake cannot hold the emulator forever.
++extern "C" void recomp_rsp_force_sig3(uint8_t* rdram) {
++    g_diag_sig_writes[5].fetch_add(1, std::memory_order_relaxed);
++    g_sp_status.fetch_or(kSpStatusSignal3, std::memory_order_relaxed);
++    publish_sp_status(rdram);
++}
++
+ extern "C" uint32_t recomp_rsp_consume_preempt_skip_budget(void) {
+     uint32_t old_budget = g_sp_status_preempt_skip_budget.load(std::memory_order_relaxed);
+     while (old_budget != 0) {
+diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
+index 41ba094..30af8fd 100644
+--- a/thirdparty/concurrentqueue/lightweightsemaphore.h
++++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
+@@ -24,7 +24,7 @@ extern "C" {
+ }
+ #elif defined(__MACH__)
+ #include <mach/mach.h>
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__SWITCH__)
+ #include <semaphore.h>
+ 
+ #if defined(__GLIBC_PREREQ) && defined(_GNU_SOURCE)
+@@ -165,7 +165,7 @@ public:
+ 		}
+ 	}
+ };
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__SWITCH__)
+ //---------------------------------------------------------
+ // Semaphore (POSIX, Linux)
+ //---------------------------------------------------------
+diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
+index 43032ea..bf2df87 100644
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -54,7 +54,7 @@ namespace ultramodern {
+             auto operator<=>(const WindowHandle&) const = default;
+         };
+ // TODO add a native window handle option here (Display/Window for x11 and ANativeWindow for Android) as a compile-time option.
+-#elif defined(__linux__) || defined(__ANDROID__)
++#elif defined(__linux__) || defined(__ANDROID__) || defined(__SWITCH__)
+         using WindowHandle = SDL_Window*;
+ #elif defined(__APPLE__)
+         struct WindowHandle {
+diff --git a/ultramodern/include/ultramodern/ultra_trace.hpp b/ultramodern/include/ultramodern/ultra_trace.hpp
+index fb38ef2..c5739a3 100644
+--- a/ultramodern/include/ultramodern/ultra_trace.hpp
++++ b/ultramodern/include/ultramodern/ultra_trace.hpp
+@@ -153,6 +153,13 @@ void psr_cosim_set_active_context(unsigned char* rdram, void* ctx);
+  *   pos in [0, recomp_ultra_trace_boot_count()) is filled.
+  *   pos in [recomp_ultra_trace_boot_count(), recomp_ultra_trace_boot_capacity())
+  *     is empty (never reached). */
++/* Scheduler-class events only (osSpTask*, osDpSetStatus, ~sp_done, ~dp_done, and osSendMesg of
++ * 0x64..0x68 to the game's scheduler queue): a small ring that survives long enough to inspect a
++ * scheduler wedge. idx runs over [count - capacity, count). */
++uint64_t recomp_ultra_trace_sched_count(void);
++uint32_t recomp_ultra_trace_sched_capacity(void);
++int      recomp_ultra_trace_sched_get(uint64_t idx, recomp_ultra_trace_event* out);
++
+ uint32_t recomp_ultra_trace_boot_count(void);
+ uint32_t recomp_ultra_trace_boot_capacity(void);
+ int      recomp_ultra_trace_boot_get(uint32_t pos,
+diff --git a/ultramodern/src/error_handling.cpp b/ultramodern/src/error_handling.cpp
+index 8ca779e..f415d72 100644
+--- a/ultramodern/src/error_handling.cpp
++++ b/ultramodern/src/error_handling.cpp
+@@ -21,7 +21,7 @@ void ultramodern::error_handling::message_box(const char* msg) {
+ void ultramodern::error_handling::quick_exit(const char* filename, int line, const char *func, int exit_status) {
+     fprintf(stderr, "Exiting with exit status '%i'. Function %s, at file %s:%i\n", exit_status, func, filename, line);
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__SWITCH__)
+     std::_Exit(exit_status);
+ #else
+     std::quick_exit(exit_status);
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index a101a5d..7b0d70f 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -828,6 +828,15 @@ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void set_dummy_vi(bool odd);
+ 
++#ifdef __SWITCH__
++// ScreenUpdateActions queued but not yet taken by the gfx thread. GLideN64 presents on the gfx thread and blocks on
++// vsync, so presenting every update drains the queue at exactly the VI rate: a backlog built during one slow display
++// list (first shader compiles) never shrinks, and moodycamel keeps serving the VI thread's fuller producer while the
++// game thread's gfx task starves (the game then waits forever for its DP-done message). Updates that have a newer one
++// queued behind them are skipped, which lets the queue empty.
++static std::atomic_int pending_screen_updates{0};
++#endif
++
+ void vi_thread_func() {
+     ultramodern::set_native_thread_name("VI Thread");
+     // Run above every other thread: this thread's cadence is what keeps the game
+@@ -878,6 +887,9 @@ void vi_thread_func() {
+         // Hand the current VI register state to the graphics thread as a screen update.
+         // Issuing it before update_vi() matches presenting the previous frame once its
+         // scanout has finished.
++#ifdef __SWITCH__
++        pending_screen_updates.fetch_add(1);
++#endif
+         events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+ 
+         // Advance the VI registers and flip to the next field/state.
+@@ -1188,6 +1200,11 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+             }
+             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
+                 events_context.vi.update_screen_regs = screen_update_action->regs;
++#ifdef __SWITCH__
++                if (pending_screen_updates.fetch_sub(1) > 1) {
++                    continue;   // a newer update is already queued behind this one: skip presenting it
++                }
++#endif
+                 renderer_context->update_screen();
+                 display_refresh_rate = renderer_context->get_display_framerate();
+                 resolution_scale = renderer_context->get_resolution_scale();
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index b71698b..0cc50f5 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -12,6 +12,12 @@
+ //   - Queue-event ring buffer (always-on) + ultramodern_mesg_recent_copy
+ //     accessor for runner-side diagnostics (commit dd8137d).
+ //
++// Modified 2026 for the Nintendo Switch port of Pokemon Stadium:
++//   - Every host->guest delivery path (osSendMesg/osRecvMesg flush, scheduler
++//     tick, idle wait) now keeps reliable events when the target queue is full
++//     (parked and retried in order). wait_for_external_message{,_timed} used
++//     to ignore do_send()'s result and silently drop them.
++//
+ // Copyright (c) 2026 Matthew Stanley
+ //
+ // ---------------------------------------------------------------------
+@@ -21,6 +27,8 @@
+ #include <cstdint>
+ #include <thread>
+ #include <cstdio>
++#include <deque>
++#include <mutex>
+ 
+ #include "blockingconcurrentqueue.h"
+ 
+@@ -257,75 +265,126 @@ s32 ultramodern::post_rcp_event(RDRAM_ARG PTR(OSMesgQueue) mq, OSMesg msg, bool
+     return 0;
+ }
+ 
+-// Counter for how many external messages have been re-queued after a
+-// transient target-queue-full failure. Surfaced via the runner's
+-// status command so a sustained nonzero value indicates a target
+-// queue is being overrun (receiver thread starved).
++// How many reliable external messages found their target OSMesgQueue full and had to be parked for retry. Surfaced
++// via the runner's status command and heartbeat: a sustained nonzero value means a target queue is being overrun
++// (receiver thread starved).
+ static std::atomic<uint64_t> g_external_requeues{0};
+ 
++// Reliable external messages (SP/DP/SI/AI/PI completions, timers, generic host posts) whose target queue was full.
++// They are never dropped: they wait here, oldest first, and are retried ahead of anything newer whenever a game
++// thread touches the message system (osSendMesg / osRecvMesg / the scheduler tick / the idle wait). Retrying in place
++// keeps them in order, which re-queueing at the tail of external_messages did not. g_external_pending counts every
++// message that has been neither delivered nor dropped yet, parked ones included.
++static std::mutex g_parked_mutex;
++static std::deque<QueuedMessage> g_parked;
++static std::atomic<uint32_t> g_parked_count{0};
++
++enum class Delivery { Delivered, Dropped, Full };
++
++static bool target_queue_full(RDRAM_ARG PTR(OSMesgQueue) mq_) {
++    if (uint32_t(mq_) < 0x80000000u || uint32_t(mq_) >= 0x80800000u) {
++        return false;   // not a queue at all: do_send rejects (and reports) it
++    }
++    const OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
++    return mq->msgCount > 0 && mq->validCount >= mq->msgCount;
++}
++
++// Hand one external message to its guest queue.
++//   Delivered / Dropped: the message is finished (g_external_pending is already adjusted).
++//   Full: a reliable message found its target full; the caller must park it.
++// Reliability classes (see post_rcp_event / ultramodern.hpp):
++//  - COALESCIBLE (VI retrace / PRENMI) is dropped on a full queue: a missed retrace is just a missed frame tick, as on
++//    hardware. This is also what breaks the boot lost-wakeup where a game points OS_EVENT_SP/DP/VI at one shared
++//    OSMesgQueue (PMS-J's osScheduler interruptQ): re-queuing the 60 Hz VI flood starved the SP/DP completions behind it.
++//  - RELIABLE (SP/DP/SI/AI/PI completions + generic host posts) is NEVER dropped. These release blocked tasks/threads;
++//    losing one is a lost wake-up for the guest (Pokemon Stadium: a lost SP-done leaves the scheduler's RSP slot
++//    occupied for good and the game freezes with audio and VI still running).
++// NB: doesn't apply to OS_MESG_BLOCK semantics - that path is direct (skips this external queue).
++static Delivery try_deliver(RDRAM_ARG const QueuedMessage& m) {
++    const bool in_kseg0 = uint32_t(m.mq) >= 0x80000000u && uint32_t(m.mq) < 0x80800000u;
++    const OSMesgQueue* mq_pre = in_kseg0 ? TO_PTR(OSMesgQueue, m.mq) : nullptr;
++    const uint16_t vb = uint16_t(mq_pre ? mq_pre->validCount : 0);
++    if (target_queue_full(PASS_RDRAM m.mq)) {
++        if (m.coalescible) {
++            g_external_pending.fetch_sub(1, std::memory_order_relaxed);
++            mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_DROP,
++                             uint32_t(m.mq), uint32_t(uintptr_t(m.mesg)), vb, vb, false, true);
++            return Delivery::Dropped;
++        }
++        return Delivery::Full;
++    }
++    const bool ok = do_send(PASS_RDRAM m.mq, m.mesg, m.jam, false);
++    g_external_pending.fetch_sub(1, std::memory_order_relaxed);
++    if (!ok) {
++        // do_send only fails on a room-to-spare queue when the queue is corrupt (it has just reported that).
++        // Retrying forever would wedge every later event, so the message is dropped.
++        return Delivery::Dropped;
++    }
++    const OSMesgQueue* mq_post = TO_PTR(OSMesgQueue, m.mq);
++    mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_OK,
++                     uint32_t(m.mq), uint32_t(uintptr_t(m.mesg)),
++                     vb, uint16_t(mq_post->validCount), false, true);
++    return Delivery::Delivered;
++}
++
++static void park_message(RDRAM_ARG const QueuedMessage& m) {
++    uint32_t parked_now;
++    {
++        std::lock_guard<std::mutex> lock{ g_parked_mutex };
++        g_parked.push_back(m);
++        parked_now = g_parked_count.fetch_add(1, std::memory_order_relaxed) + 1;
++    }
++    const uint64_t total = g_external_requeues.fetch_add(1, std::memory_order_relaxed) + 1;
++    const OSMesgQueue* mq = TO_PTR(OSMesgQueue, m.mq);
++    mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_FULL,
++                     uint32_t(m.mq), uint32_t(uintptr_t(m.mesg)),
++                     uint16_t(mq->validCount), uint16_t(mq->validCount), false, true);
++    // Log the first few and then every 256th: this is the situation the old silent-drop paths turned into a lost wake-up.
++    if (total <= 16 || (total & 0xFF) == 0) {
++        std::fprintf(stderr,
++            "[mesg] reliable message 0x%08X for queue 0x%08X found it full (%d/%d): parked for retry "
++            "(parked now %u, parked in total %llu)\n",
++            uint32_t(uintptr_t(m.mesg)), uint32_t(m.mq), int(mq->validCount), int(mq->msgCount),
++            parked_now, (unsigned long long)total);
++        std::fflush(stderr);
++    }
++}
++
++// Deliver what can be delivered of the parked messages, oldest first. Returns how many landed.
++static size_t retry_parked(RDRAM_ARG1) {
++    if (g_parked_count.load(std::memory_order_relaxed) == 0) {
++        return 0;
++    }
++    std::deque<QueuedMessage> work;
++    {
++        std::lock_guard<std::mutex> lock{ g_parked_mutex };
++        work.swap(g_parked);
++        g_parked_count.store(0, std::memory_order_relaxed);
++    }
++    std::deque<QueuedMessage> still_full;
++    size_t landed = 0;
++    for (const QueuedMessage& m : work) {
++        if (try_deliver(PASS_RDRAM m) == Delivery::Full) {
++            still_full.push_back(m);
++        } else {
++            landed++;
++        }
++    }
++    if (!still_full.empty()) {
++        std::lock_guard<std::mutex> lock{ g_parked_mutex };
++        g_parked.insert(g_parked.begin(), still_full.begin(), still_full.end());
++        g_parked_count.fetch_add(uint32_t(still_full.size()), std::memory_order_relaxed);
++    }
++    return landed;
++}
++
+ void dequeue_external_messages(RDRAM_ARG1) {
++    // Parked reliable messages first (they are older than anything still in external_messages), then the new arrivals.
++    retry_parked(PASS_RDRAM1);
+     QueuedMessage to_send;
+     while (external_messages.try_dequeue(to_send)) {
+-        g_external_pending.fetch_sub(1, std::memory_order_relaxed);
+-        OSMesgQueue* mq_pre = TO_PTR(OSMesgQueue, to_send.mq);
+-        const uint16_t vb = uint16_t(mq_pre ? mq_pre->validCount : 0);
+-        // Try non-blocking send first.
+-        bool ok = do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
+-        if (!ok) {
+-            // Target OSMesgQueue is full. Behavior now depends on the event's
+-            // reliability class (see post_rcp_event / ultramodern.hpp):
+-            //
+-            //  - COALESCIBLE (VI retrace / PRENMI): DROP it and keep draining.
+-            //    A missed retrace is just a missed frame tick (hardware-accurate
+-            //    on a full queue). Critically, this is what BREAKS the boot
+-            //    lost-wakeup: a game that points OS_EVENT_SP/DP/VI at one shared
+-            //    OSMesgQueue (PMS-J's osScheduler interruptQ) gets a 60Hz VI
+-            //    flood; re-queuing those VIs to the tail perpetually starved the
+-            //    SP/DP gfx-task-completion events behind them, so osScheduler
+-            //    never marked the task done and the boot pipeline parked. VI must
+-            //    not accumulate in the external queue.
+-            //
+-            //  - RELIABLE (SP/DP/SI/AI/PI completions + generic host posts):
+-            //    NEVER drop. These release blocked tasks/threads; losing one
+-            //    lost-wakeups the guest. Re-queue at the tail and bail this drain
+-            //    pass (we must NOT spin re-enqueuing with no chance for the
+-            //    receiver to drain). The caller (the game thread inside
+-            //    osSendMesg/osRecvMesg) returns and runs, the receiver dequeues
+-            //    and frees space, and the next dequeue_external_messages retries.
+-            //    With VI now dropped instead of re-queued, the reliable event is
+-            //    no longer starved.
+-            //
+-            // Historical context: Pokemon Stadium hit the reliable case on its
+-            // gfx scheduler queue 0x800A6CD0 — audio SP DONE + VI ticks (~110
+-            // events/sec) briefly filled a cap=16 queue and the gfx RDP DONE for
+-            // the third boot-logo dlist was dropped, softlocking Game_Thread. The
+-            // original fix re-queued EVERYTHING (incl. VI); this refines it so VI
+-            // coalesces and only true completions are guaranteed.
+-            //
+-            // NB: doesn't apply to OS_MESG_BLOCK semantics — that path is direct
+-            // (skips this external queue).
+-            if (to_send.coalescible) {
+-                mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_DROP,
+-                                 uint32_t(to_send.mq),
+-                                 uint32_t(uintptr_t(to_send.mesg)),
+-                                 vb, vb, false, true);
+-                continue;
+-            }
+-            mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_FULL,
+-                             uint32_t(to_send.mq),
+-                             uint32_t(uintptr_t(to_send.mesg)),
+-                             vb, vb, false, true);
+-            external_messages.enqueue(to_send);
+-            g_external_pending.fetch_add(1, std::memory_order_relaxed);
+-            g_external_requeues.fetch_add(1, std::memory_order_relaxed);
+-            break;
+-        } else {
+-            OSMesgQueue* mq_post = TO_PTR(OSMesgQueue, to_send.mq);
+-            const uint16_t va = uint16_t(mq_post ? mq_post->validCount : 0);
+-            mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_OK,
+-                             uint32_t(to_send.mq),
+-                             uint32_t(uintptr_t(to_send.mesg)),
+-                             vb, va, false, true);
++        if (try_deliver(PASS_RDRAM to_send) == Delivery::Full) {
++            park_message(PASS_RDRAM to_send);
+         }
+     }
+ }
+@@ -335,6 +394,11 @@ extern "C" uint64_t ultramodern_external_requeues(void) {
+     return g_external_requeues.load(std::memory_order_relaxed);
+ }
+ 
++// Reliable messages parked right now (their target queue was full).
++extern "C" uint32_t ultramodern_external_parked(void) {
++    return g_parked_count.load(std::memory_order_relaxed);
++}
++
+ #ifdef N64_COSIM
+ extern "C" uint32_t ultramodern_cosim_checkpoint_external_pending(void) {
+     if (g_external_pending.load(std::memory_order_relaxed) != 0) {
+@@ -363,14 +427,17 @@ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+         }
+     }
+ #else
+-    if (external_messages.try_dequeue(to_send)) {
+-        g_external_pending.fetch_sub(1, std::memory_order_relaxed);
+-        do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
++    // Reliable messages parked on a full queue go first; if one lands the idle thread has something to run.
++    if (retry_parked(PASS_RDRAM1) != 0) {
+         return;
+     }
+-    external_messages.wait_dequeue(to_send);
+-    g_external_pending.fetch_sub(1, std::memory_order_relaxed);
+-    do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
++    if (!external_messages.try_dequeue(to_send)) {
++        external_messages.wait_dequeue(to_send);
++    }
++    // A full target used to lose the message here (do_send's result was ignored): park it instead.
++    if (try_deliver(PASS_RDRAM to_send) == Delivery::Full) {
++        park_message(PASS_RDRAM to_send);
++    }
+ #endif
+ }
+ 
+@@ -381,14 +448,23 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG1, u32 millis) {
+         return;
+     }
+ #endif
++    retry_parked(PASS_RDRAM1);
+     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+-        g_external_pending.fetch_sub(1, std::memory_order_relaxed);
+-        do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
++        // The scheduler tick delivers through here at loop back-edges, often while the guest scheduler thread is still
++        // draining a retrace backlog and its queue is full. do_send's result used to be ignored, which dropped
++        // reliable SP/DP completions silently.
++        if (try_deliver(PASS_RDRAM to_send) == Delivery::Full) {
++            park_message(PASS_RDRAM to_send);
++        }
+     }
+ }
+ 
+ bool ultramodern::external_message_pending() {
+-    if (g_external_pending.load(std::memory_order_relaxed) != 0) {
++    // Parked messages are retried by the message calls themselves; counting them here would make every loop back-edge
++    // retry them while their queue is still full.
++    const int64_t fresh = int64_t(g_external_pending.load(std::memory_order_relaxed))
++                        - int64_t(g_parked_count.load(std::memory_order_relaxed));
++    if (fresh > 0) {
+         return true;
+     }
+ #ifdef N64_COSIM
+@@ -659,6 +735,10 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
+         mesg_log::record(rdram, mesg_log::OP_RECV_RETURN_OK,
+                          uint32_t(mq_), got, vb_enter, va,
+                          flags == OS_MESG_BLOCK, true);
++        if (g_parked_count.load(std::memory_order_relaxed) != 0) {
++            // This receive may have freed the slot a parked reliable message was waiting for.
++            retry_parked(PASS_RDRAM1);
++        }
+     }
+ 
+     // A higher-priority thread may now be runnable; reschedule if so.
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index bea3b12..cd7739b 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -108,6 +108,18 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+ }
+ 
+ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
++#elif defined(__SWITCH__)
++// Implemented in switch/threads_switch.c: names pick the core, priorities map to HOS priorities.
++extern "C" void psrnx_place_thread(const char* name);
++extern "C" void psrnx_set_thread_priority(int level);
++
++void ultramodern::set_native_thread_name(const std::string& name) {
++    psrnx_place_thread(name.c_str());
++}
++
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {
++    psrnx_set_thread_priority(static_cast<int>(pri));
++}
+ #endif
+ 
+ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+diff --git a/ultramodern/src/ultra_trace.cpp b/ultramodern/src/ultra_trace.cpp
+index 48a2611..165047f 100644
+--- a/ultramodern/src/ultra_trace.cpp
++++ b/ultramodern/src/ultra_trace.cpp
+@@ -70,6 +70,32 @@ struct Slot {
+ 
+ Slot                       g_ring[kCapacity];
+ Slot                       g_boot[kBootCapacity];
++
++/* Scheduler-class events only (SP/DP task start and completion, messages to the
++ * game's scheduler queue). The sliding ring above holds ~1 s of history on a busy
++ * game, so a wedge that is only noticed 10-20 s later has already scrolled out of
++ * it. After a wedge nothing of this class is produced any more, so this ring still
++ * ends exactly at the last scheduler events. */
++constexpr uint32_t kSchedCapacity = 4096;
++constexpr uint32_t kSchedMask     = kSchedCapacity - 1;
++Slot                       g_sched[kSchedCapacity];
++std::atomic<uint64_t>      g_sched_idx{0};
++/* Stadium's scheduler message queue (D_800A62E0.queue); messages 0x64..0x68. */
++constexpr uint32_t kSchedQueue = 0x800A6CD0u;
++
++bool is_sched_event(const char* n, uint32_t a0, uint32_t a1) {
++    if (n == nullptr) return false;
++    if (n[0] == '~') {                                     /* ~sp_done, ~dp_done */
++        return (n[1] == 's' || n[1] == 'd') && n[2] == 'p';
++    }
++    if (n[0] != 'o' || n[1] != 's') return false;
++    if (n[2] == 'S' && n[3] == 'p' && n[4] == 'T') return true;   /* osSpTask* */
++    if (n[2] == 'D' && n[3] == 'p' && n[4] == 'S') return true;   /* osDpSetStatus */
++    if (n[2] == 'S' && n[3] == 'e' && n[4] == 'n') {              /* osSendMesg to the scheduler */
++        return a0 == kSchedQueue && a1 >= 0x64u && a1 <= 0x68u;
++    }
++    return false;
++}
+ std::atomic<uint64_t>      g_write_idx{0};
+ std::atomic<uint32_t>      g_boot_count{0};
+ 
+@@ -152,6 +178,10 @@ extern "C" void recomp_ultra_trace_record(const char* name,
+     /* Sliding ring (recent window). */
+     fill(g_ring[seq & kMask]);
+ 
++    if (is_sched_event(name, a0, a1)) {
++        fill(g_sched[g_sched_idx.fetch_add(1, std::memory_order_relaxed) & kSchedMask]);
++    }
++
+     /* Boot snapshot — fill once, never evict. */
+     uint32_t b = g_boot_count.fetch_add(1, std::memory_order_relaxed);
+     if (b < kBootCapacity) {
+@@ -203,6 +233,33 @@ extern "C" int recomp_ultra_trace_get(uint64_t idx,
+     return (got == idx) ? 1 : 0;
+ }
+ 
++extern "C" uint64_t recomp_ultra_trace_sched_count(void) {
++    return g_sched_idx.load(std::memory_order_relaxed);
++}
++
++extern "C" uint32_t recomp_ultra_trace_sched_capacity(void) {
++    return kSchedCapacity;
++}
++
++/* idx is the logical index in [count - capacity, count). seq in `out` is the GLOBAL trace seq. */
++extern "C" int recomp_ultra_trace_sched_get(uint64_t idx, recomp_ultra_trace_event* out) {
++    if (out == nullptr) return 0;
++    Slot& s = g_sched[idx & kSchedMask];
++    uint64_t got = s.seq.load(std::memory_order_acquire);
++    std::memcpy(out->name, s.name, sizeof(out->name));
++    out->pc  = s.pc;
++    out->a0  = s.a0;
++    out->a1  = s.a1;
++    out->a2  = s.a2;
++    out->a3  = s.a3;
++    out->thread = s.thread;
++    out->thread_id = s.thread_id;
++    out->pad = s.pad;
++    out->ms  = s.ms;
++    out->seq = got;
++    return got != UINT64_MAX ? 1 : 0;
++}
++
+ extern "C" uint32_t recomp_ultra_trace_boot_count(void) {
+     uint32_t c = g_boot_count.load(std::memory_order_relaxed);
+     /* Saturate to capacity for callers; they shouldn't iterate
